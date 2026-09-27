@@ -1,0 +1,82 @@
+name: iPhone app to TestFlight
+# Run by hand (Actions → iPhone app to TestFlight → Run workflow) to build the app on a GitHub Mac, sign it and its
+# share extension for the App Store and upload it to TestFlight. Setup and the secrets it needs: README, "iPhone builds".
+on:
+  workflow_dispatch:
+concurrency: { group: testflight, cancel-in-progress: false }
+jobs:
+  testflight:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with: { xcode-version: latest-stable }
+
+      - name: Install the signing certificate and provisioning profiles
+        env:
+          CERT: ${{ secrets.IOS_DIST_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          APP_PROFILE: ${{ secrets.IOS_PROFILE }}
+          SHARE_PROFILE: ${{ secrets.IOS_SHARE_PROFILE }}
+        run: |
+          set -euo pipefail
+          [ -n "$CERT" ] && [ -n "$APP_PROFILE" ] && [ -n "$SHARE_PROFILE" ] || {
+            echo "::error::IOS_DIST_CERT_P12, IOS_PROFILE and IOS_SHARE_PROFILE secrets are not all set (see README, iPhone builds)"; exit 1; }
+          KC="$RUNNER_TEMP/signing.keychain-db" KC_PASSWORD="$(openssl rand -base64 24)"
+          echo -n "$CERT" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASSWORD" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASSWORD" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASSWORD" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          # Each profile names the bundle ID it is for, so it does not matter which secret holds which.
+          PAIRS=() EXPORT_PROFILES=""
+          for name in app share; do
+            var="$(echo "$name" | tr a-z A-Z)_PROFILE"
+            echo -n "${!var}" | base64 --decode -o "$RUNNER_TEMP/$name.mobileprovision"
+            security cms -D -i "$RUNNER_TEMP/$name.mobileprovision" > "$RUNNER_TEMP/$name.plist"
+            UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$RUNNER_TEMP/$name.plist")
+            TEAM=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' "$RUNNER_TEMP/$name.plist")
+            BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' "$RUNNER_TEMP/$name.plist" | cut -d. -f2-)
+            for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+              mkdir -p "$d"; cp "$RUNNER_TEMP/$name.mobileprovision" "$d/$UUID.mobileprovision"; done
+            PAIRS+=("$BUNDLE=$UUID"); EXPORT_PROFILES+="<key>$BUNDLE</key><string>$UUID</string>"
+          done
+          echo "TEAM_ID=$TEAM" >> "$GITHUB_ENV"; echo "EXPORT_PROFILES=$EXPORT_PROFILES" >> "$GITHUB_ENV"
+          node scripts/ios-signing.mjs "$TEAM" "${PAIRS[@]}"
+
+      - name: Build and sign
+        run: |
+          set -euo pipefail
+          # TestFlight needs every upload to carry a higher build number than the last; the run number always grows.
+          xcodebuild -project TorrentStation.xcodeproj -scheme TorrentStation -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" CURRENT_PROJECT_VERSION=${{ github.run_number }} archive
+          cat > "$RUNNER_TEMP/export.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>provisioningProfiles</key><dict>$EXPORT_PROFILES</dict>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" -exportOptionsPlist "$RUNNER_TEMP/export.plist" -exportPath "$RUNNER_TEMP/export"
+
+      - name: Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf '%s\n' "$ASC_KEY_P8" > ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+          xcrun altool --upload-app --type ios --file "$RUNNER_TEMP"/export/*.ipa --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          echo "Uploaded build ${{ github.run_number }}. It appears in TestFlight once Apple has processed it (usually 5–30 minutes)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true

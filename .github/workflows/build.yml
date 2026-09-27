@@ -1,0 +1,20 @@
+name: Build
+# Builds the app and its share extension on a GitHub Mac for every pull request and push to main, so a change that
+# does not compile shows up here rather than in Xcode. Unsigned, for the simulator; TestFlight builds are testflight.yml.
+on:
+  pull_request:
+    paths-ignore: ['**.md']
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+concurrency: { group: 'build-${{ github.ref }}', cancel-in-progress: true }
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with: { xcode-version: latest-stable }
+      - run: xcodebuild -project TorrentStation.xcodeproj -scheme TorrentStation -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
